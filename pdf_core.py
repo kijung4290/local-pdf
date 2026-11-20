@@ -214,6 +214,43 @@ class Document:
             buffer = copy.tobytes(garbage=4, deflate=True, encryption=pdf.PDF_ENCRYPT_KEEP)
         atomic_write(path, buffer)
 
+    def copy_pages(self, indices):
+        if not self.allowed(pdf.PDF_PERM_COPY) or not self.allowed(pdf.PDF_PERM_ASSEMBLE):
+            raise ValueError("이 PDF의 페이지를 복사할 권한이 없습니다.")
+        if not indices or any(index < 0 or index >= self.pdf.page_count for index in indices):
+            raise ValueError("복사할 페이지를 선택하세요.")
+        indices = sorted(set(indices))
+        ranges = []
+        first = previous = indices[0]
+        for index in indices[1:]:
+            if index != previous + 1:
+                ranges.append((first, previous))
+                first = index
+            previous = index
+        ranges.append((first, previous))
+        with pdf.open() as fragment:
+            for number, (first, last) in enumerate(ranges):
+                fragment.insert_pdf(self.pdf, from_page=first, to_page=last, final=number == len(ranges) - 1)
+            if len(ranges) > 1:
+                self.copy_links_between_ranges(fragment, indices, ranges)
+            return fragment.tobytes(garbage=4, deflate=True)
+
+    def copy_links_between_ranges(self, fragment, indices, ranges):
+        destination = {original: new for new, original in enumerate(indices)}
+        # insert_pdf retains links within the range being copied. Restore links between selected ranges.
+        for first, last in ranges:
+            for index in range(first, last + 1):
+                original = self.pdf[index]
+                page = fragment[destination[index]]
+                for link in original.get_links():
+                    target = link.get("page")
+                    if link["kind"] != pdf.LINK_GOTO or target not in destination or first <= target <= last:
+                        continue
+                    page.insert_link({"kind": pdf.LINK_GOTO, "page": destination[target],
+                                      "from": link["from"] * original.derotation_matrix,
+                                      "to": link["to"] * self.pdf[target].derotation_matrix,
+                                      "zoom": link.get("zoom", 0)})
+
 
 def page_indices(value, count):
     if not value.strip():

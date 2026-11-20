@@ -220,7 +220,7 @@ class Updates(QObject):
         if error:
             self.window.error("업데이트 다운로드", error)
             return
-        if not self.window.confirm_discard():
+        if not self.window.confirm_close_documents():
             installer.unlink(missing_ok=True)
             return
         try:

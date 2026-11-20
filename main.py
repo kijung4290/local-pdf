@@ -1,15 +1,16 @@
+from dataclasses import dataclass
 from pathlib import Path
 import os
 import sys
 from urllib.parse import quote
 
-from PySide6.QtCore import QDir, QPointF, QSize, QTimer, Qt
+from PySide6.QtCore import QDir, QMimeData, QPointF, QSignalBlocker, QSize, QTimer, Qt
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtPrintSupport import QAbstractPrintDialog, QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QColorDialog, QComboBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog,
-    QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPushButton, QSizePolicy, QSpinBox, QStackedWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QPushButton, QSizePolicy, QSpinBox, QStackedWidget, QTabBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
 )
 import pymupdf as pdf
 
@@ -21,8 +22,9 @@ from widgets import IMAGE_FILTER, PageView, PagesDialog, PasswordDialog, TextDia
 
 
 APP = "로컬 PDF"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 ROOT = Path(__file__).resolve().parent
+PAGE_CLIPBOARD = "application/vnd.localpdf.pages+pdf"
 MODES = {
     "hand": ("보기", "페이지를 드래그해 이동합니다. Ctrl+휠로 확대하거나 축소할 수 있습니다."),
     "edit": ("텍스트 수정", "바꿀 텍스트 줄을 클릭하세요."),
@@ -44,7 +46,7 @@ MODES = {
 GROUPS = (
     ("편집", ("hand", "edit", "insert", "image", "redact", "copy"), ("watermark", "numbers", "security")),
     ("주석", ("highlight", "underline", "strike", "memo", "read_note", "ink", "rectangle", "erase_note"), ()),
-    ("페이지", ("crop",), ("rotate", "blank", "duplicate", "move_up", "move_down", "delete", "append", "presentation")),
+    ("페이지", ("crop",), ("copy_pages", "paste_pages", "rotate", "blank", "duplicate", "move_up", "move_down", "delete", "append", "presentation")),
     ("파일", (), ("export", "from_images", "print", "saveas", "default")),
 )
 
@@ -101,10 +103,24 @@ def panel(name, margins, spacing):
     return widget, layout
 
 
+@dataclass
+class DocumentTab:
+    document: Document
+    page: int = 0
+    zoom: str | float = "page"
+    mode: str = "hand"
+    group: int = 0
+    navigation: int = 0
+    selected_pages: tuple[int, ...] = ()
+    scroll_position: QPointF | None = None
+    query: str = ""
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.doc = None
+        self.active_tab = None
         self.page_index = 0
         self.zoom = "page"
         self.last_text_settings = None
@@ -129,6 +145,7 @@ class MainWindow(QMainWindow):
         self.resize_timer = QTimer(self, interval=90, singleShot=True)
         self.resize_timer.timeout.connect(self.fit_after_resize)
         self.update_state()
+        QApplication.clipboard().dataChanged.connect(self.update_page_actions)
         self.updates = Updates(self, VERSION)
 
     def action(self, menu, key, title, callback, shortcut=None):
@@ -149,6 +166,7 @@ class MainWindow(QMainWindow):
         self.action(file, "from_images", "이미지로 PDF 만들기…", self.create_from_images)
         self.action(file, "save", "저장", self.save, QKeySequence.StandardKey.Save)
         self.action(file, "saveas", "다른 이름으로 저장…", self.save_as, QKeySequence.StandardKey.SaveAs)
+        self.action(file, "close_tab", "현재 PDF 탭 닫기", lambda: self.close_tab(self.tabs.currentIndex()), "Ctrl+W")
         self.action(file, "export", "페이지 내보내기…", self.export_pages)
         self.action(file, "print", "인쇄…", self.print_pdf, QKeySequence.StandardKey.Print)
         self.action(file, "security", "암호 보호…", self.security)
@@ -168,6 +186,9 @@ class MainWindow(QMainWindow):
         self.action(pages, "previous", "이전 페이지", lambda: self.go_page(self.page_index - 1), "PgUp")
         self.action(pages, "next", "다음 페이지", lambda: self.go_page(self.page_index + 1), "PgDown")
         pages.addSeparator()
+        self.action(pages, "copy_pages", "페이지 복사", self.copy_selected_pages, QKeySequence.StandardKey.Copy)
+        self.action(pages, "paste_pages", "현재 페이지 뒤에 붙여넣기", self.paste_pages, QKeySequence.StandardKey.Paste)
+        pages.addSeparator()
         self.action(pages, "rotate", "오른쪽으로 90° 회전", self.turn_page)
         self.action(pages, "blank", "빈 페이지 추가", lambda: self.add_page(False))
         self.action(pages, "duplicate", "현재 페이지 복제", lambda: self.add_page(True))
@@ -179,6 +200,8 @@ class MainWindow(QMainWindow):
         self.action(view, "pagefit", "페이지 맞춤", lambda: self.set_zoom("page"), "Ctrl+0")
         self.action(view, "widthfit", "너비 맞춤", lambda: self.set_zoom("width"))
         self.action(view, "presentation", "전체 화면 발표", self.toggle_presentation, "F11")
+        self.action(view, "next_tab", "다음 PDF 탭", lambda: self.step_tab(1), "Ctrl+Tab")
+        self.action(view, "prev_tab", "이전 PDF 탭", lambda: self.step_tab(-1), "Ctrl+Shift+Tab")
         self.action(view, "updates", "업데이트 확인…", lambda: self.updates.check(manual=True))
         self.action(view, "about", "로컬 PDF 정보", self.about)
 
@@ -221,6 +244,18 @@ class MainWindow(QMainWindow):
         mast.addWidget(self.button("저장", action="save", name="mastSave", tooltip="Ctrl+S"))
         root.addWidget(masthead)
         self.masthead = masthead
+
+        self.tabs = QTabBar(objectName="documentTabs")
+        self.tabs.setAccessibleName("열린 PDF 탭")
+        self.tabs.setDocumentMode(True)
+        self.tabs.setExpanding(False)
+        self.tabs.setMovable(True)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.setElideMode(Qt.TextElideMode.ElideMiddle)
+        self.tabs.currentChanged.connect(self.activate_tab)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        root.addWidget(self.tabs)
 
         toolbar = QFrame(objectName="toolbar")
         tools = QHBoxLayout(toolbar)
@@ -289,11 +324,14 @@ class MainWindow(QMainWindow):
         self.thumbs.setWrapping(False)
         self.thumbs.setResizeMode(QListView.ResizeMode.Adjust)
         self.thumbs.setMovement(QListView.Movement.Static)
+        self.thumbs.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
         self.thumbs.setVerticalScrollMode(QListView.ScrollMode.ScrollPerPixel)
         self.thumbs.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.thumbs.setIconSize(QSize(94, 108))
         self.thumbs.setGridSize(QSize(128, 141))
-        self.thumbs.currentRowChanged.connect(self.go_page)
+        self.thumbs.currentRowChanged.connect(lambda row: self.go_page(row, sync_thumbnail=False))
+        self.thumbs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.thumbs.customContextMenuRequested.connect(self.thumbnail_menu)
         self.thumbs.verticalScrollBar().valueChanged.connect(lambda: self.thumbs_timer.start())
         self.navigation.addWidget(self.thumbs)
         self.bookmarks = QTreeWidget(objectName="bookmarks")
@@ -397,9 +435,16 @@ class MainWindow(QMainWindow):
             self.file_label.setText(doc.name + modified)
             self.file_label.setToolTip(str(doc.path) if doc.path else "새 PDF")
             self.security_label.setText("암호 보호" if doc.protected else "")
+            index = self.tabs.currentIndex()
+            self.tabs.setTabText(index, doc.name.replace("&", "&&") + modified)
+            self.tabs.setTabToolTip(index, self.file_label.toolTip())
         else:
             length = 0
             self.setWindowTitle(APP)
+            self.file_label.setText("열린 문서 없음")
+            self.file_label.setToolTip("")
+            self.security_label.clear()
+        self.tabs.setVisible(active and self.presentation_state is None)
         self.page_number.blockSignals(True)
         self.page_number.setRange(1 if active else 0, length)
         self.page_number.setValue(self.page_index + 1 if active else 0)
@@ -431,6 +476,17 @@ class MainWindow(QMainWindow):
         self.actions["saveas"].setEnabled(active)
         self.actions["undo"].setEnabled(active and bool(doc.past))
         self.actions["redo"].setEnabled(active and bool(doc.future))
+        self.actions["close_tab"].setEnabled(active and self.presentation_state is None)
+        for name in ("next_tab", "prev_tab"):
+            self.actions[name].setEnabled(self.tabs.count() > 1 and self.presentation_state is None)
+        self.update_page_actions()
+
+    def update_page_actions(self):
+        doc = self.doc
+        clipboard = QApplication.clipboard().mimeData()
+        can_assemble = doc is not None and doc.allowed(pdf.PDF_PERM_ASSEMBLE)
+        self.actions["copy_pages"].setEnabled(can_assemble and doc.allowed(pdf.PDF_PERM_COPY))
+        self.actions["paste_pages"].setEnabled(can_assemble and clipboard is not None and clipboard.hasFormat(PAGE_CLIPBOARD))
 
     def error(self, title, error):
         QMessageBox.warning(self, title, str(error) or "이 작업을 완료할 수 없습니다.")
@@ -438,7 +494,8 @@ class MainWindow(QMainWindow):
     def confirm_discard(self):
         if not self.doc or not self.doc.dirty:
             return True
-        box = QMessageBox(QMessageBox.Icon.Question, "변경 사항 저장", "현재 PDF에 저장하지 않은 변경 사항이 있습니다.", parent=self)
+        box = QMessageBox(QMessageBox.Icon.Question, "변경 사항 저장", f"{self.doc.name}\n저장하지 않은 변경 사항이 있습니다.", parent=self)
+        box.setTextFormat(Qt.TextFormat.PlainText)
         save = box.addButton("저장", QMessageBox.ButtonRole.AcceptRole)
         skip = box.addButton("저장 안 함", QMessageBox.ButtonRole.DestructiveRole)
         box.addButton("취소", QMessageBox.ButtonRole.RejectRole)
@@ -462,29 +519,103 @@ class MainWindow(QMainWindow):
                 return None
 
     def open_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(self, "PDF 열기", "", "PDF 문서 (*.pdf)")
-        if path:
+        paths, _ = QFileDialog.getOpenFileNames(self, "PDF 열기", "", "PDF 문서 (*.pdf)")
+        for path in paths:
             self.open_document(path)
 
     def open_document(self, path):
-        if not self.confirm_discard():
-            return
+        resolved = Path(path).resolve()
+        for index in range(self.tabs.count()):
+            if self.tabs.tabData(index).document.path == resolved:
+                self.tabs.setCurrentIndex(index)
+                return
         opened = self.read_document(path)
-        if not opened:
-            return
-        self.load_document(opened)
+        if opened:
+            self.load_document(opened)
 
     def load_document(self, opened):
-        if self.doc:
-            self.doc.pdf.close()
-        self.doc, self.page_index = opened, 0
-        self.search_box.clear()
+        with QSignalBlocker(self.tabs):
+            index = self.tabs.addTab(opened.name)
+            self.tabs.setTabData(index, DocumentTab(opened))
+            self.tabs.setCurrentIndex(index)
+        self.activate_tab(index)
+
+    def store_tab(self):
+        tab = self.active_tab
+        if tab is None:
+            return
+        tab.page = self.page_index
+        tab.zoom = self.zoom
+        tab.mode = self.page_view.mode
+        tab.group = self.inspector_stack.currentIndex()
+        tab.navigation = self.navigator.currentIndex()
+        tab.query = self.search_box.text()
+        tab.selected_pages = tuple(self.thumbs.row(item) for item in self.thumbs.selectedItems())
+        center = self.page_view.viewport().rect().center()
+        tab.scroll_position = self.page_view.mapToScene(center) / self.page_view.scale
+
+    def activate_tab(self, index):
+        tab = self.tabs.tabData(index) if index >= 0 else None
+        if tab is not None and tab is self.active_tab:
+            return
+        self.store_tab()
+        self.active_tab = tab
+        self.doc = tab.document if tab else None
+        self.page_index = tab.page if tab else 0
+        self.zoom = tab.zoom if tab else "page"
+        self.search_box.setText(tab.query if tab else "")
         self.reset_search()
         self.page_lines = None
         self.update_state()
-        self.set_mode("hand")
+        if tab is None:
+            self.thumbs.clear()
+            self.bookmarks.clear()
+            self.zoom_status.clear()
+            self.status.setText("PDF를 열어 시작하세요.")
+            return
+        self.set_mode(tab.mode if self.actions[tab.mode].isEnabled() else "hand", reveal=False)
+        self.group_buttons.button(tab.group).setChecked(True)
+        self.inspector_stack.setCurrentIndex(tab.group)
+        self.navigator.setCurrentIndex(tab.navigation)
         self.refresh_thumbnails()
+        if tab.selected_pages:
+            with QSignalBlocker(self.thumbs):
+                self.thumbs.clearSelection()
+                for page in tab.selected_pages:
+                    if item := self.thumbs.item(page):
+                        item.setSelected(True)
+        self.update_zoom_box()
         self.render_page()
+        if tab.scroll_position is not None:
+            self.page_view.centerOn(tab.scroll_position * self.page_view.scale)
+        self.page_view.setFocus()
+
+    def step_tab(self, step):
+        if self.tabs.count() > 1 and self.presentation_state is None:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() + step) % self.tabs.count())
+
+    def close_tab(self, index):
+        if not 0 <= index < self.tabs.count():
+            return
+        self.tabs.setCurrentIndex(index)
+        if not self.confirm_discard():
+            return
+        self.doc.pdf.close()
+        self.active_tab = None
+        self.doc = None
+        with QSignalBlocker(self.tabs):
+            self.tabs.removeTab(index)
+        self.activate_tab(self.tabs.currentIndex())
+
+    def confirm_close_documents(self):
+        original = self.tabs.currentIndex()
+        for index in range(self.tabs.count()):
+            if self.tabs.tabData(index).document.dirty:
+                self.tabs.setCurrentIndex(index)
+                if not self.confirm_discard():
+                    return False
+        self.tabs.setCurrentIndex(original)
+        return True
 
     def choose_path(self, suffix="_편집", extension="pdf"):
         folder = self.doc.path.parent if self.doc.path else Path(QDir.homePath())
@@ -506,6 +637,12 @@ class MainWindow(QMainWindow):
         return self.write_document(self.doc.path) if self.doc.path else self.save_as()
 
     def write_document(self, path, password=None):
+        target = Path(path).resolve()
+        for index in range(self.tabs.count()):
+            other = self.tabs.tabData(index).document
+            if other is not self.doc and other.path == target:
+                self.error("PDF 저장", "다른 탭에서 열려 있는 파일입니다. 다른 이름으로 저장하세요.")
+                return False
         signature_flags = self.doc.pdf.get_sigflags()
         if signature_flags > 0 and signature_flags & 2:
             answer = QMessageBox.question(self, "디지털 서명", "이 PDF의 기존 디지털 서명이 저장 후 무효화될 수 있습니다. 계속 저장할까요?")
@@ -530,7 +667,7 @@ class MainWindow(QMainWindow):
 
     def create_from_images(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "PDF에 담을 이미지 선택", "", IMAGE_FILTER)
-        if not paths or not self.confirm_discard():
+        if not paths:
             return
         try:
             doc = document_from_images(image_bytes(path) for path in paths)
@@ -659,12 +796,13 @@ class MainWindow(QMainWindow):
             except Exception as error:
                 self.error("텍스트를 읽을 수 없습니다", error)
 
-    def go_page(self, index):
+    def go_page(self, index, sync_thumbnail=True):
         if not self.doc or index == self.page_index or not 0 <= index < self.doc.pdf.page_count:
             return
         self.page_index = index
         self.page_lines = None
-        self.select_thumbnail()
+        if sync_thumbnail:
+            self.select_thumbnail()
         self.update_state()
         self.render_page()
 
@@ -682,14 +820,17 @@ class MainWindow(QMainWindow):
         if not self.doc:
             return
         self.zoom = value
-        index = self.zoom_box.findData(value)
+        self.update_zoom_box()
+        self.render_page(keep_position=isinstance(value, float))
+
+    def update_zoom_box(self):
+        index = self.zoom_box.findData(self.zoom)
         if index < 0:
             if self.zoom_box.count() > 11:
                 self.zoom_box.removeItem(11)
-            self.zoom_box.addItem(f"{value:.0%}", value)
+            self.zoom_box.addItem(f"{self.zoom:.0%}", self.zoom)
             index = self.zoom_box.count() - 1
         self.zoom_box.setCurrentIndex(index)
-        self.render_page(keep_position=isinstance(value, float))
 
     def zoom_step(self, step):
         if self.doc:
@@ -729,6 +870,41 @@ class MainWindow(QMainWindow):
             self.thumbs.scrollToItem(item)
         self.thumbs.blockSignals(False)
         self.thumbs_timer.start()
+
+    def thumbnail_menu(self, position):
+        if not self.doc:
+            return
+        menu = QMenu(self)
+        menu.addAction(self.actions["copy_pages"])
+        menu.addAction(self.actions["paste_pages"])
+        menu.exec(self.thumbs.viewport().mapToGlobal(position))
+
+    def copy_selected_pages(self):
+        indices = sorted(self.thumbs.row(item) for item in self.thumbs.selectedItems()) or [self.page_index]
+        try:
+            fragment = self.doc.copy_pages(indices)
+        except Exception as error:
+            self.error("페이지 복사", error)
+            return
+        mime = QMimeData()
+        mime.setData(PAGE_CLIPBOARD, fragment)
+        QApplication.clipboard().setMimeData(mime)
+        self.status.setText(f"{len(indices)}페이지를 복사했습니다. 삽입할 위치에서 Ctrl+V를 누르세요.")
+
+    def paste_pages(self):
+        clipboard = QApplication.clipboard().mimeData()
+        if clipboard is None or not clipboard.hasFormat(PAGE_CLIPBOARD):
+            return
+        try:
+            with pdf.open(stream=bytes(clipboard.data(PAGE_CLIPBOARD)), filetype="pdf") as copied:
+                if not copied.is_pdf or copied.is_encrypted or not copied.page_count:
+                    raise ValueError("클립보드에서 붙여넣을 PDF 페이지를 찾지 못했습니다.")
+                first = self.page_index + 1
+                start = first if first < self.doc.pdf.page_count else -1
+                self.mutate(f"{copied.page_count}페이지 붙여넣기", pdf.PDF_PERM_ASSEMBLE,
+                            lambda target: target.insert_pdf(copied, start_at=start), first, structure=True)
+        except Exception as error:
+            self.error("페이지 붙여넣기", error)
 
     def refresh_thumbnails(self):
         self.thumbs.blockSignals(True)
@@ -1003,9 +1179,10 @@ class MainWindow(QMainWindow):
             self.showFullScreen()
             self.set_zoom("page")
             self.page_view.setFocus()
+        self.update_state()
 
     def chrome(self):
-        return self.menuBar(), self.masthead, self.toolbar, self.sidebar, self.inspector, self.footer
+        return self.menuBar(), self.masthead, self.tabs, self.toolbar, self.sidebar, self.inspector, self.footer
 
     def keyPressEvent(self, event):
         if self.presentation_state:
@@ -1124,25 +1301,29 @@ class MainWindow(QMainWindow):
                 painter.end()
 
     def dragEnterEvent(self, event):
-        if self.dropped_path(event):
+        if self.dropped_paths(event):
             event.acceptProposedAction()
 
     @staticmethod
-    def dropped_path(event):
-        return next((url.toLocalFile() for url in event.mimeData().urls()
-                     if url.isLocalFile() and url.toLocalFile().lower().endswith(".pdf")), None)
+    def dropped_paths(event):
+        return [url.toLocalFile() for url in event.mimeData().urls()
+                if url.isLocalFile() and url.toLocalFile().lower().endswith(".pdf")]
 
     def dropEvent(self, event):
-        path = self.dropped_path(event)
-        if path:
+        paths = self.dropped_paths(event)
+        if paths:
             event.acceptProposedAction()
-            self.open_document(path)
+            for path in paths:
+                self.open_document(path)
 
     def closeEvent(self, event):
-        if self.closing_for_update or self.confirm_discard():
+        if self.closing_for_update or self.confirm_close_documents():
             self.search_timer.stop()
-            if self.doc:
-                self.doc.pdf.close()
+            self.thumbs_timer.stop()
+            self.resize_timer.stop()
+            for index in range(self.tabs.count()):
+                self.tabs.tabData(index).document.pdf.close()
+            self.doc = None
             event.accept()
         else:
             event.ignore()
@@ -1156,8 +1337,12 @@ def main():
     app.setStyleSheet((ROOT / "assets/style.qss").read_text(encoding="utf-8"))
     window = MainWindow()
     window.show()
-    if len(sys.argv) > 1 and Path(sys.argv[1]).is_file():
-        QTimer.singleShot(0, lambda: window.open_document(sys.argv[1]))
+    paths = [path for path in sys.argv[1:] if Path(path).is_file()]
+    if paths:
+        def open_files():
+            for path in paths:
+                window.open_document(path)
+        QTimer.singleShot(0, open_files)
     return app.exec()
 
 

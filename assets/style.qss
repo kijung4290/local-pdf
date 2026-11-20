@@ -21,6 +21,11 @@ QToolTip { background: #263247; color: white; border: 1px solid #465772; padding
 #mastSave:disabled { color: #768499; background: #eff2f6; border-color: #e7ebf0; }
 #updateButton { color: #224fae; background: #e9f0fe; border-color: #d0defb; }
 
+#documentTabs { background: #f8f9fb; padding: 5px 10px 4px; }
+#documentTabs::tab { color: #536177; background: #f0f3f7; border: 1px solid #e0e6ef; border-radius: 7px; padding: 4px 8px 4px 11px; margin-right: 4px; min-width: 90px; max-width: 218px; min-height: 22px; }
+#documentTabs::tab:hover { background: #eef4ff; border-color: #cddcf5; }
+#documentTabs::tab:selected { background: white; border-color: #b9cef5; color: #204ba8; font-weight: 650; }
+
 #toolbar { background: #f8f9fb; border-top: 1px solid #ebedf2; border-bottom: 1px solid #dce2eb; }
 #sidebar, #inspector { background: #f8f9fb; }
 #sidebar { border-right: 1px solid #dce2eb; }
