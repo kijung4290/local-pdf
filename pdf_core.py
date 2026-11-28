@@ -203,11 +203,40 @@ class Document:
         self.saved_revision = self.revision
 
     def extract(self, indices, path):
-        if not self.allowed(pdf.PDF_PERM_COPY) or not self.allowed(pdf.PDF_PERM_ASSEMBLE):
-            raise ValueError("이 PDF의 페이지를 추출할 권한이 없습니다.")
         if self.path and Path(path).resolve() == self.path:
             raise ValueError("추출할 페이지를 새 파일 이름으로 저장하세요.")
-        with self.open_bytes(self.snapshot(0).data) as copy:
+        self.check_extract_permission()
+        self.write_extract(self.snapshot(0).data, indices, path)
+
+    def split(self, folder, pages_per_file):
+        self.check_extract_permission()
+        count = self.pdf.page_count
+        if not 1 <= pages_per_file < count:
+            raise ValueError("파일당 페이지 수를 전체 페이지 수보다 작게 입력하세요.")
+        stem = Path(self.name).stem
+        output = Path(folder) / f"{stem}_분할"
+        if output.exists():
+            raise FileExistsError(f"‘{output.name}’ 폴더가 이미 있습니다. 다른 저장 위치를 선택하세요.")
+        source = self.snapshot(0).data
+        width = max(3, len(str(count)))
+        paths = []
+        with tempfile.TemporaryDirectory(prefix=".localpdf-", dir=folder) as temporary:
+            staging = Path(temporary) / "pages"
+            staging.mkdir()
+            for first in range(0, count, pages_per_file):
+                last = min(first + pages_per_file, count)
+                name = f"{stem}_{first + 1:0{width}}-{last:0{width}}.pdf"
+                self.write_extract(source, list(range(first, last)), staging / name)
+                paths.append(output / name)
+            staging.rename(output)
+        return paths
+
+    def check_extract_permission(self):
+        if not self.allowed(pdf.PDF_PERM_COPY) or not self.allowed(pdf.PDF_PERM_ASSEMBLE):
+            raise ValueError("이 PDF의 페이지를 추출할 권한이 없습니다.")
+
+    def write_extract(self, source, indices, path):
+        with self.open_bytes(source) as copy:
             copy.select(indices)
             for name in copy.embfile_names():
                 copy.embfile_del(name)
@@ -250,6 +279,19 @@ class Document:
                                       "from": link["from"] * original.derotation_matrix,
                                       "to": link["to"] * self.pdf[target].derotation_matrix,
                                       "zoom": link.get("zoom", 0)})
+
+
+def organize_pages(doc, plan):
+    original = list(range(doc.page_count))
+    indices = [index for index, _ in plan]
+    if not indices or len(set(indices)) != len(indices) or any(index not in range(doc.page_count) for index in indices):
+        raise ValueError("유효한 페이지를 하나 이상 남겨야 합니다.")
+    if indices != original:
+        doc.select(indices)
+    for index, (_, rotation) in enumerate(plan):
+        if rotation:
+            page = doc[index]
+            page.set_rotation(page.rotation + rotation)
 
 
 def page_indices(value, count):

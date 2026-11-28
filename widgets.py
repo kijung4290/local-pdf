@@ -1,9 +1,11 @@
-from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QPointF, QRectF, Qt, Signal, QStringListModel
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage, QImageReader, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import (QByteArray, QBuffer, QIODevice, QItemSelectionModel, QPointF, QRectF, QSignalBlocker,
+                           QSize, Qt, Signal, QStringListModel)
+from PySide6.QtGui import (QColor, QFont, QFontDatabase, QImage, QImageReader, QPainter, QPainterPath, QPen,
+                          QPixmap, QTransform)
 from PySide6.QtWidgets import (
-    QCheckBox, QColorDialog, QComboBox, QCompleter, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QCompleter, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout,
+    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout,
 )
 import pymupdf as pdf
 
@@ -461,3 +463,138 @@ class PagesDialog(QDialog):
             QMessageBox.warning(self, self.windowTitle(), str(error))
             return
         self.accept()
+
+
+class OrganizeDialog(QDialog):
+    def __init__(self, parent, doc, current):
+        super().__init__(parent)
+        self.doc = doc
+        self.setWindowTitle("페이지 정리")
+        self.resize(665, 510)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+        hint = QLabel("페이지를 끌어 순서를 바꾸세요. Ctrl 또는 Shift를 누르면 여러 장을 선택할 수 있습니다.")
+        hint.setProperty("muted", True)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        self.pages = QListWidget(objectName="organizeList")
+        self.pages.setAccessibleName("정리할 PDF 페이지")
+        self.pages.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.pages.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.pages.setDefaultDropAction(Qt.DropAction.MoveAction)
+        for index in range(doc.page_count):
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setData(Qt.ItemDataRole.UserRole + 1, 0)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
+            self.pages.addItem(item)
+            self.name_item(item)
+        body.addWidget(self.pages, 1)
+
+        self.preview = QLabel(alignment=Qt.AlignmentFlag.AlignCenter, objectName="organizePreview")
+        self.preview.setAccessibleName("선택한 페이지 미리보기")
+        self.preview.setFixedSize(235, 282)
+        body.addWidget(self.preview, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(body, 1)
+
+        commands = QHBoxLayout()
+        self.up = QPushButton("위로")
+        self.down = QPushButton("아래로")
+        self.left = QPushButton("왼쪽 90°")
+        self.right = QPushButton("오른쪽 90°")
+        self.remove = QPushButton("선택 삭제")
+        self.remove.setProperty("destructive", True)
+        for button, callback in ((self.up, lambda: self.move(-1)), (self.down, lambda: self.move(1)),
+                                 (self.left, lambda: self.rotate(-90)), (self.right, lambda: self.rotate(90)),
+                                 (self.remove, self.delete)):
+            button.clicked.connect(callback)
+            commands.addWidget(button)
+        commands.addStretch(1)
+        layout.addLayout(commands)
+        layout.addWidget(dialog_buttons(self, "변경 적용", self.accept))
+        self.pages.currentItemChanged.connect(self.show_preview)
+        self.pages.itemSelectionChanged.connect(self.update_commands)
+        self.pages.model().rowsMoved.connect(self.update_commands)
+        self.pages.setCurrentRow(current)
+        self.update_commands()
+
+    @property
+    def plan(self):
+        return [(item.data(Qt.ItemDataRole.UserRole), item.data(Qt.ItemDataRole.UserRole + 1))
+                for item in (self.pages.item(row) for row in range(self.pages.count()))]
+
+    def name_item(self, item):
+        index = item.data(Qt.ItemDataRole.UserRole)
+        rotation = item.data(Qt.ItemDataRole.UserRole + 1)
+        suffix = f"  ·  {rotation}° 회전" if rotation else ""
+        item.setText(f"원본 {index + 1}페이지{suffix}")
+
+    def show_preview(self, item, _previous=None):
+        if item is None:
+            self.preview.setText("페이지를 선택하세요.")
+            return
+        try:
+            page = self.doc[item.data(Qt.ItemDataRole.UserRole)]
+            rotation = item.data(Qt.ItemDataRole.UserRole + 1)
+            bounds = QSize(round(page.rect.width), round(page.rect.height))
+            if rotation % 180:
+                bounds.transpose()
+            dpr = self.devicePixelRatioF()
+            scale = dpr * min(205 / max(1, bounds.width()), 247 / max(1, bounds.height()))
+            pixmap = QPixmap.fromImage(page_image(page, scale))
+            if rotation:
+                pixmap = pixmap.transformed(QTransform().rotate(rotation), Qt.TransformationMode.SmoothTransformation)
+            pixmap.setDevicePixelRatio(dpr)
+            self.preview.setPixmap(pixmap)
+        except Exception:
+            self.preview.setText("미리보기를 표시할 수 없습니다.")
+
+    def update_commands(self, *_):
+        rows = {self.pages.row(item) for item in self.pages.selectedItems()}
+        count = self.pages.count()
+        self.up.setEnabled(any(row > 0 and row - 1 not in rows for row in rows))
+        self.down.setEnabled(any(row < count - 1 and row + 1 not in rows for row in rows))
+        self.left.setEnabled(bool(rows))
+        self.right.setEnabled(bool(rows))
+        self.remove.setEnabled(0 < len(rows) < count)
+
+    def move(self, step):
+        current = self.pages.currentItem()
+        selected = self.pages.selectedItems()
+        items = sorted(selected, key=self.pages.row, reverse=step > 0)
+        with QSignalBlocker(self.pages):
+            for item in items:
+                row = self.pages.row(item)
+                target = row + step
+                if 0 <= target < self.pages.count() and not self.pages.item(target).isSelected():
+                    self.pages.takeItem(row)
+                    self.pages.insertItem(target, item)
+                    item.setSelected(True)
+            if current:
+                self.pages.setCurrentItem(current, QItemSelectionModel.SelectionFlag.NoUpdate)
+                self.pages.scrollToItem(current)
+        self.update_commands()
+
+    def rotate(self, angle):
+        for item in self.pages.selectedItems():
+            rotation = item.data(Qt.ItemDataRole.UserRole + 1)
+            item.setData(Qt.ItemDataRole.UserRole + 1, (rotation + angle) % 360)
+            self.name_item(item)
+        self.show_preview(self.pages.currentItem())
+
+    def delete(self):
+        selected = self.pages.selectedItems()
+        if not 0 < len(selected) < self.pages.count():
+            return
+        rows = sorted((self.pages.row(item) for item in selected), reverse=True)
+        with QSignalBlocker(self.pages):
+            for row in rows:
+                self.pages.takeItem(row)
+            self.pages.setCurrentRow(min(rows[-1], self.pages.count() - 1),
+                                     QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        self.show_preview(self.pages.currentItem())
+        self.update_commands()

@@ -4,25 +4,26 @@ import os
 import sys
 from urllib.parse import quote
 
-from PySide6.QtCore import QDir, QMimeData, QPointF, QSignalBlocker, QSize, QTimer, Qt
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtCore import QDir, QMimeData, QPointF, QSettings, QSignalBlocker, QSize, QTimer, Qt
+from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtPrintSupport import QAbstractPrintDialog, QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QColorDialog, QComboBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-    QPushButton, QSizePolicy, QSpinBox, QStackedWidget, QTabBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStackedWidget, QTabBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
 )
 import pymupdf as pdf
 
+from appearance import apply_appearance
 from fonts import DEFAULT_FACE, embedding_font
 from pdf_core import (Document, PasswordRequired, add_markup, atomic_write, document_from_images,
-                      mark_page, redact_area, text_lines, write_text)
+                      mark_page, organize_pages, redact_area, text_lines, write_text)
 from updates import Updates
-from widgets import IMAGE_FILTER, PageView, PagesDialog, PasswordDialog, TextDialog, image_bytes, page_image
+from widgets import IMAGE_FILTER, OrganizeDialog, PageView, PagesDialog, PasswordDialog, TextDialog, image_bytes, page_image
 
 
 APP = "로컬 PDF"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 ROOT = Path(__file__).resolve().parent
 PAGE_CLIPBOARD = "application/vnd.localpdf.pages+pdf"
 MODES = {
@@ -46,8 +47,9 @@ MODES = {
 GROUPS = (
     ("편집", ("hand", "edit", "insert", "image", "redact", "copy"), ("watermark", "numbers", "security")),
     ("주석", ("highlight", "underline", "strike", "memo", "read_note", "ink", "rectangle", "erase_note"), ()),
-    ("페이지", ("crop",), ("copy_pages", "paste_pages", "rotate", "blank", "duplicate", "move_up", "move_down", "delete", "append", "presentation")),
-    ("파일", (), ("export", "from_images", "print", "saveas", "default")),
+    ("페이지", ("crop",), ("organize", "copy_pages", "paste_pages", "rotate", "rotate_left", "blank", "duplicate",
+                          "move_up", "move_down", "delete", "append", "presentation")),
+    ("파일", (), ("export", "split", "from_images", "print", "saveas", "default")),
 )
 
 
@@ -66,25 +68,37 @@ ICON_LINES = {
     "rectangle": [((3,5),(17,5),(17,15),(3,15),(3,5))],
     "erase_note": [((5,6),(15,6)), ((7,6),(7,16),(13,16),(13,6)), ((8,4),(12,4))],
     "crop": [((5,3),(5,15),(17,15)), ((3,5),(15,5),(15,17))],
+    "sidebar": [((2,4),(18,4),(18,16),(2,16),(2,4)), ((7,4),(7,16)), ((4,8),(5,8)), ((4,11),(5,11))],
+    "inspector": [((2,4),(18,4),(18,16),(2,16),(2,4)), ((13,4),(13,16)), ((15,8),(16,8)), ((15,11),(16,11))],
+    "undo": [((7,4),(3,8),(7,12)), ((3,8),(12,8),(15,9),(17,12),(17,15))],
+    "redo": [((13,4),(17,8),(13,12)), ((17,8),(8,8),(5,9),(3,12),(3,15))],
+    "close": [((5,5),(15,15)), ((15,5),(5,15))],
+    "paper": [((6,2),(13,2),(17,6),(17,15),(6,15),(6,2)), ((13,2),(13,6),(17,6)),
+              ((9,8),(14,8)), ((9,11),(14,11)), ((3,6),(3,18),(14,18))],
 }
 ICON_LINES["read_note"] = ICON_LINES["memo"]
 
 
-def tool_icon(key):
+def tool_icon(key, colors):
     icon = QIcon()
-    for mode, color in ((QIcon.Mode.Normal, "#526784"), (QIcon.Mode.Disabled, "#a0aabd")):
-        raster = QPixmap(40, 40)
-        raster.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(raster)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.scale(2, 2)
-        painter.setPen(QPen(QColor(color), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-        for stroke in ICON_LINES[key]:
-            painter.drawPolyline(QPolygonF([QPointF(x, y) for x, y in stroke]))
-        painter.end()
-        raster.setDevicePixelRatio(2)
+    for mode, color in ((QIcon.Mode.Normal, colors["muted"]), (QIcon.Mode.Disabled, colors["disabled"])):
+        raster = draw_icon(key, color, 20)
         icon.addPixmap(raster, mode)
     return icon
+
+
+def draw_icon(key, color, size):
+    raster = QPixmap(size * 2, size * 2)
+    raster.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(raster)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.scale(size / 10, size / 10)
+    painter.setPen(QPen(QColor(color), 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    for stroke in ICON_LINES[key]:
+        painter.drawPolyline(QPolygonF([QPointF(x, y) for x, y in stroke]))
+    painter.end()
+    raster.setDevicePixelRatio(2)
+    return raster
 
 
 def label(text, name="", muted=False):
@@ -131,8 +145,11 @@ class MainWindow(QMainWindow):
         self.annotation_color = QColor("#346ce0")
         self.presentation_state = None
         self.closing_for_update = False
-        self.setMinimumSize(1030, 680)
-        self.resize(1360, 865)
+        self.settings = QSettings(QSettings.defaultFormat(), QSettings.Scope.UserScope, "LocalPDF", "LocalPDF")
+        self.stylesheet = (ROOT / "assets/style.qss").read_text(encoding="utf-8")
+        self.tool_icons = {}
+        self.setMinimumSize(940, 620)
+        self.resize(1320, 840)
         self.setAcceptDrops(True)
         self.setWindowIcon(QIcon(str(ROOT / "assets/app.ico")))
         self.actions = {}
@@ -144,6 +161,9 @@ class MainWindow(QMainWindow):
         self.thumbs_timer.timeout.connect(self.render_thumbnails)
         self.resize_timer = QTimer(self, interval=90, singleShot=True)
         self.resize_timer.timeout.connect(self.fit_after_resize)
+        scheme = self.settings.value("appearance", "system", type=str)
+        self.set_appearance(scheme if scheme in self.appearances else "system")
+        QApplication.styleHints().colorSchemeChanged.connect(self.refresh_appearance)
         self.update_state()
         QApplication.clipboard().dataChanged.connect(self.update_page_actions)
         self.updates = Updates(self, VERSION)
@@ -163,11 +183,14 @@ class MainWindow(QMainWindow):
         pages = self.menuBar().addMenu("페이지")
         view = self.menuBar().addMenu("보기")
         self.action(file, "open", "PDF 열기…", self.open_dialog, QKeySequence.StandardKey.Open)
+        self.recent_menu = file.addMenu("최근 문서")
+        self.recent_menu.aboutToShow.connect(self.refresh_recent)
         self.action(file, "from_images", "이미지로 PDF 만들기…", self.create_from_images)
         self.action(file, "save", "저장", self.save, QKeySequence.StandardKey.Save)
         self.action(file, "saveas", "다른 이름으로 저장…", self.save_as, QKeySequence.StandardKey.SaveAs)
         self.action(file, "close_tab", "현재 PDF 탭 닫기", lambda: self.close_tab(self.tabs.currentIndex()), "Ctrl+W")
         self.action(file, "export", "페이지 내보내기…", self.export_pages)
+        self.action(file, "split", "PDF 여러 파일로 나누기…", self.split_pdf)
         self.action(file, "print", "인쇄…", self.print_pdf, QKeySequence.StandardKey.Print)
         self.action(file, "security", "암호 보호…", self.security)
         self.action(file, "owner", "소유자 암호 입력…", self.unlock_owner)
@@ -189,7 +212,9 @@ class MainWindow(QMainWindow):
         self.action(pages, "copy_pages", "페이지 복사", self.copy_selected_pages, QKeySequence.StandardKey.Copy)
         self.action(pages, "paste_pages", "현재 페이지 뒤에 붙여넣기", self.paste_pages, QKeySequence.StandardKey.Paste)
         pages.addSeparator()
-        self.action(pages, "rotate", "오른쪽으로 90° 회전", self.turn_page)
+        self.action(pages, "organize", "페이지 정리…", self.show_organizer)
+        self.action(pages, "rotate", "오른쪽으로 90° 회전", lambda: self.turn_page(90))
+        self.action(pages, "rotate_left", "왼쪽으로 90° 회전", lambda: self.turn_page(-90))
         self.action(pages, "blank", "빈 페이지 추가", lambda: self.add_page(False))
         self.action(pages, "duplicate", "현재 페이지 복제", lambda: self.add_page(True))
         self.action(pages, "move_up", "페이지를 앞으로 이동", lambda: self.move_page(-1))
@@ -197,11 +222,25 @@ class MainWindow(QMainWindow):
         self.action(pages, "delete", "현재 페이지 삭제…", self.delete_page)
         self.action(pages, "append", "다른 PDF 이어 붙이기…", self.append_pdf)
         self.action(view, "find", "텍스트 찾기", self.focus_search, QKeySequence.StandardKey.Find)
+        self.action(view, "sidebar", "페이지 탐색 패널", lambda: self.update_panels(remember=True), "Ctrl+Shift+1")
+        self.action(view, "inspector", "편집 도구 패널", lambda: self.update_panels(remember=True), "Ctrl+Shift+2")
+        for name in ("sidebar", "inspector"):
+            self.actions[name].setCheckable(True)
+            self.actions[name].setChecked(self.settings.value(name, True, type=bool))
         self.action(view, "pagefit", "페이지 맞춤", lambda: self.set_zoom("page"), "Ctrl+0")
         self.action(view, "widthfit", "너비 맞춤", lambda: self.set_zoom("width"))
         self.action(view, "presentation", "전체 화면 발표", self.toggle_presentation, "F11")
         self.action(view, "next_tab", "다음 PDF 탭", lambda: self.step_tab(1), "Ctrl+Tab")
         self.action(view, "prev_tab", "이전 PDF 탭", lambda: self.step_tab(-1), "Ctrl+Shift+Tab")
+        appearance = view.addMenu("화면 테마")
+        self.appearance_group = QActionGroup(self)
+        self.appearances = {}
+        for scheme, name in (("system", "시스템 설정 따르기"), ("light", "밝게"), ("dark", "어둡게")):
+            option = appearance.addAction(name)
+            option.setCheckable(True)
+            option.triggered.connect(lambda checked, value=scheme: self.set_appearance(value))
+            self.appearance_group.addAction(option)
+            self.appearances[scheme] = option
         self.action(view, "updates", "업데이트 확인…", lambda: self.updates.check(manual=True))
         self.action(view, "about", "로컬 PDF 정보", self.about)
 
@@ -212,27 +251,60 @@ class MainWindow(QMainWindow):
         if action:
             command = self.actions[action]
             button.clicked.connect(command.trigger)
-            command.changed.connect(lambda: button.setEnabled(command.isEnabled()))
-            button.setEnabled(command.isEnabled())
+            button.setCheckable(command.isCheckable())
+
+            def sync():
+                button.setEnabled(command.isEnabled())
+                if button.isCheckable() and command.isCheckable():
+                    button.setChecked(command.isChecked())
+
+            command.changed.connect(sync)
+            sync()
         else:
             button.clicked.connect(callback)
         if tooltip:
             button.setToolTip(tooltip)
+            if not title or len(title) == 1:
+                button.setAccessibleName(tooltip)
         return button
+
+    def tool_button(self, key, tooltip):
+        button = self.button("", action=key, name="toolIcon", tooltip=tooltip)
+        button.setIconSize(QSize(19, 19))
+        self.tool_icons[key] = button
+        return button
+
+    def set_appearance(self, scheme):
+        self.appearance = scheme
+        self.appearances[scheme].setChecked(True)
+        self.settings.setValue("appearance", scheme)
+        self.refresh_appearance()
+
+    def refresh_appearance(self, *_):
+        app = QApplication.instance()
+        dark = self.appearance == "dark" or (
+            self.appearance == "system" and app.styleHints().colorScheme() == Qt.ColorScheme.Dark)
+        self.colors = apply_appearance(app, self.stylesheet, dark)
+        for key, button in self.tool_icons.items():
+            button.setIcon(tool_icon(key, self.colors))
+        for index in range(self.tabs.count()):
+            button = self.tabs.tabButton(index, QTabBar.ButtonPosition.RightSide)
+            button.setIcon(tool_icon("close", self.colors))
+        self.empty_symbol.setPixmap(draw_icon("paper", self.colors["accent"], 57))
 
     def setup_ui(self):
         host, root = panel("root", (0, 0, 0, 0), 0)
         self.setCentralWidget(host)
         masthead = QFrame(objectName="masthead")
         mast = QHBoxLayout(masthead)
-        mast.setContentsMargins(17, 12, 17, 12)
-        mast.setSpacing(11)
+        mast.setContentsMargins(19, 10, 19, 10)
+        mast.setSpacing(12)
         brand_icon = QLabel()
-        brand_icon.setPixmap(self.windowIcon().pixmap(QSize(32, 32)))
+        brand_icon.setPixmap(self.windowIcon().pixmap(QSize(28, 28)))
         mast.addWidget(brand_icon)
         mast.addWidget(label(APP, "brand"))
-        mast.addWidget(label("│", "mastDivider"))
-        self.file_label = label("열린 문서 없음", "filename")
+        mast.addWidget(QFrame(objectName="mastDivider", frameShape=QFrame.Shape.VLine))
+        self.file_label = label("열린 문서 없음", "filename", True)
         self.file_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         mast.addWidget(self.file_label, 1)
         self.security_label = label("", "lockState")
@@ -248,23 +320,33 @@ class MainWindow(QMainWindow):
         self.tabs = QTabBar(objectName="documentTabs")
         self.tabs.setAccessibleName("열린 PDF 탭")
         self.tabs.setDocumentMode(True)
+        self.tabs.setDrawBase(False)
         self.tabs.setExpanding(False)
         self.tabs.setMovable(True)
-        self.tabs.setTabsClosable(True)
         self.tabs.setUsesScrollButtons(True)
         self.tabs.setElideMode(Qt.TextElideMode.ElideMiddle)
         self.tabs.currentChanged.connect(self.activate_tab)
-        self.tabs.tabCloseRequested.connect(self.close_tab)
-        root.addWidget(self.tabs)
 
         toolbar = QFrame(objectName="toolbar")
         tools = QHBoxLayout(toolbar)
-        tools.setContentsMargins(14, 9, 14, 9)
-        tools.setSpacing(7)
-        tools.addWidget(self.button("실행 취소", action="undo", tooltip="Ctrl+Z"))
-        tools.addWidget(self.button("다시 실행", action="redo", tooltip="Ctrl+Y"))
-        tools.addSpacing(14)
-        tools.addWidget(self.button("‹", action="previous", name="arrow", tooltip="이전 페이지"))
+        tools.setContentsMargins(16, 6, 16, 8)
+        tools.setSpacing(12)
+
+        def tool_cluster():
+            frame = QFrame(objectName="toolCluster")
+            cluster = QHBoxLayout(frame)
+            cluster.setContentsMargins(2, 2, 2, 2)
+            cluster.setSpacing(3)
+            tools.addWidget(frame)
+            return cluster
+
+        history = tool_cluster()
+        history.addWidget(self.tool_button("sidebar", "페이지 탐색 패널 (Ctrl+Shift+1)"))
+        history.addWidget(self.tool_button("inspector", "편집 도구 패널 (Ctrl+Shift+2)"))
+        history.addWidget(self.tool_button("undo", "실행 취소 (Ctrl+Z)"))
+        history.addWidget(self.tool_button("redo", "다시 실행 (Ctrl+Y)"))
+        pagination = tool_cluster()
+        pagination.addWidget(self.button("‹", action="previous", name="arrow", tooltip="이전 페이지"))
         self.page_number = QSpinBox()
         self.page_number.setRange(0, 0)
         self.page_number.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
@@ -273,14 +355,14 @@ class MainWindow(QMainWindow):
         self.page_number.setFixedWidth(50)
         self.page_number.setAccessibleName("현재 페이지")
         self.page_number.valueChanged.connect(lambda value: self.go_page(value - 1))
-        tools.addWidget(self.page_number)
+        pagination.addWidget(self.page_number)
         self.page_total = label("/ 0", "pageTotal", True)
-        tools.addWidget(self.page_total)
-        tools.addWidget(self.button("›", action="next", name="arrow", tooltip="다음 페이지"))
-        tools.addSpacing(14)
+        pagination.addWidget(self.page_total)
+        pagination.addWidget(self.button("›", action="next", name="arrow", tooltip="다음 페이지"))
+        scale_tools = tool_cluster()
         self.zoom_out = self.button("−", lambda: self.zoom_step(-1), name="arrow", tooltip="축소")
         self.zoom_in = self.button("+", lambda: self.zoom_step(1), name="arrow", tooltip="확대")
-        tools.addWidget(self.zoom_out)
+        scale_tools.addWidget(self.zoom_out)
         self.zoom_box = QComboBox()
         self.zoom_box.setFixedWidth(115)
         self.zoom_box.setAccessibleName("확대 비율")
@@ -288,10 +370,11 @@ class MainWindow(QMainWindow):
                              *[(f"{n}%", n / 100) for n in (25, 50, 75, 100, 125, 150, 200, 300, 400)]]:
             self.zoom_box.addItem(title, value)
         self.zoom_box.activated.connect(lambda index: self.set_zoom(self.zoom_box.itemData(index)))
-        tools.addWidget(self.zoom_box)
-        tools.addWidget(self.zoom_in)
+        scale_tools.addWidget(self.zoom_box)
+        scale_tools.addWidget(self.zoom_in)
         tools.addStretch(1)
         self.search_box = QLineEdit()
+        self.search_box.setObjectName("searchBox")
         self.search_box.setPlaceholderText("문서에서 텍스트 찾기")
         self.search_box.setAccessibleName("문서에서 텍스트 찾기")
         self.search_box.setFixedWidth(178)
@@ -306,14 +389,18 @@ class MainWindow(QMainWindow):
         tools.addWidget(self.find_prev)
         tools.addWidget(self.find_forward)
         root.addWidget(toolbar)
+        root.addWidget(self.tabs)
         self.toolbar = toolbar
 
         work = QHBoxLayout()
-        work.setSpacing(0)
+        work.setContentsMargins(8, 8, 8, 8)
+        work.setSpacing(8)
         root.addLayout(work, 1)
-        sidebar, left = panel("sidebar", (10, 13, 10, 9), 8)
-        sidebar.setFixedWidth(163)
+        self.work = work
+        sidebar, left = panel("sidebar", (11, 12, 11, 9), 7)
+        sidebar.setFixedWidth(168)
         self.sidebar = sidebar
+        left.addWidget(label("문서 탐색", "panelTitle"))
         self.navigator = QComboBox()
         self.navigator.addItems(["페이지", "문서 목차"])
         left.addWidget(self.navigator)
@@ -352,9 +439,10 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.page_view)
         work.addWidget(self.stack, 1)
 
-        inspector, right = panel("inspector", (12, 13, 12, 12), 9)
-        inspector.setFixedWidth(247)
+        inspector, right = panel("inspector", (11, 12, 11, 10), 9)
+        inspector.setFixedWidth(244)
         self.inspector = inspector
+        right.addWidget(label("도구", "panelTitle"))
         route = QFrame(objectName="route")
         routes = QHBoxLayout(route)
         routes.setContentsMargins(3, 3, 3, 3)
@@ -374,7 +462,7 @@ class MainWindow(QMainWindow):
             for mode in modes:
                 tool, description = MODES[mode]
                 control = self.button(tool, action=mode, name="modeButton", tooltip=description)
-                control.setIcon(tool_icon(mode))
+                self.tool_icons[mode] = control
                 control.setIconSize(QSize(17, 17))
                 control.setCheckable(True)
                 self.mode_group.addButton(control)
@@ -390,7 +478,12 @@ class MainWindow(QMainWindow):
                 controls.addWidget(self.color_button)
                 self.show_color()
             controls.addStretch(1)
-            self.inspector_stack.addWidget(group)
+            scroller = QScrollArea(objectName="inspectorScroll")
+            scroller.setFrameShape(QFrame.Shape.NoFrame)
+            scroller.setWidgetResizable(True)
+            scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroller.setWidget(group)
+            self.inspector_stack.addWidget(scroller)
         self.group_buttons.button(0).setChecked(True)
         work.addWidget(inspector)
 
@@ -409,17 +502,21 @@ class MainWindow(QMainWindow):
     def empty_view(self):
         screen, layout = panel("emptyView", (22, 22, 22, 22), 0)
         layout.addStretch(1)
-        card, content = panel("emptyCard", (38, 36, 38, 35), 11)
-        card.setFixedWidth(390)
-        symbol = QLabel()
-        symbol.setPixmap(self.windowIcon().pixmap(QSize(58, 58)))
-        content.addWidget(symbol, alignment=Qt.AlignmentFlag.AlignHCenter)
+        card, content = panel("emptyCard", (28, 33, 28, 32), 12)
+        card.setFixedWidth(410)
+        self.empty_symbol = QLabel(objectName="emptySymbol", alignment=Qt.AlignmentFlag.AlignCenter)
+        self.empty_symbol.setFixedSize(89, 89)
+        content.addWidget(self.empty_symbol, alignment=Qt.AlignmentFlag.AlignHCenter)
         content.addWidget(label("PDF 열기", "emptyTitle"), alignment=Qt.AlignmentFlag.AlignHCenter)
         content.addWidget(label("문서를 이곳에 끌어 놓거나 파일을 선택하세요.", muted=True),
                           alignment=Qt.AlignmentFlag.AlignHCenter)
         content.addSpacing(6)
-        content.addWidget(self.button("파일 선택", action="open", name="emptyOpen"),
-                          alignment=Qt.AlignmentFlag.AlignHCenter)
+        start = QHBoxLayout()
+        start.addStretch()
+        start.addWidget(self.button("파일 열기", action="open", name="emptyOpen"))
+        start.addWidget(self.button("이미지로 PDF 만들기", action="from_images"))
+        start.addStretch()
+        content.addLayout(start)
         layout.addWidget(card, alignment=Qt.AlignmentFlag.AlignHCenter)
         layout.addStretch(1)
         return screen
@@ -459,6 +556,7 @@ class MainWindow(QMainWindow):
             self.actions[name].setEnabled(active and doc.allowed(pdf.PDF_PERM_MODIFY))
         for name, permission in (("copy", pdf.PDF_PERM_COPY), ("export", pdf.PDF_PERM_COPY),
                                  ("print", pdf.PDF_PERM_PRINT), ("rotate", pdf.PDF_PERM_ASSEMBLE),
+                                 ("rotate_left", pdf.PDF_PERM_ASSEMBLE), ("organize", pdf.PDF_PERM_ASSEMBLE),
                                  ("append", pdf.PDF_PERM_ASSEMBLE), ("blank", pdf.PDF_PERM_ASSEMBLE),
                                  ("duplicate", pdf.PDF_PERM_ASSEMBLE), ("crop", pdf.PDF_PERM_ASSEMBLE)):
             self.actions[name].setEnabled(active and doc.allowed(permission))
@@ -470,6 +568,8 @@ class MainWindow(QMainWindow):
         self.actions["move_up"].setEnabled(self.actions["rotate"].isEnabled() and self.page_index > 0)
         self.actions["move_down"].setEnabled(self.actions["rotate"].isEnabled() and self.page_index < length - 1)
         self.actions["delete"].setEnabled(self.actions["rotate"].isEnabled() and length > 1)
+        self.actions["split"].setEnabled(length > 1 and doc.allowed(pdf.PDF_PERM_COPY)
+                                         and doc.allowed(pdf.PDF_PERM_ASSEMBLE))
         self.actions["security"].setEnabled(active and doc.can_change_security)
         self.actions["owner"].setEnabled(active and doc.protected and not doc.can_change_security)
         self.actions["save"].setEnabled(active and doc.dirty)
@@ -477,6 +577,9 @@ class MainWindow(QMainWindow):
         self.actions["undo"].setEnabled(active and bool(doc.past))
         self.actions["redo"].setEnabled(active and bool(doc.future))
         self.actions["close_tab"].setEnabled(active and self.presentation_state is None)
+        for name in ("sidebar", "inspector"):
+            self.actions[name].setEnabled(active and self.presentation_state is None)
+        self.update_panels()
         for name in ("next_tab", "prev_tab"):
             self.actions[name].setEnabled(self.tabs.count() > 1 and self.presentation_state is None)
         self.update_page_actions()
@@ -528,17 +631,54 @@ class MainWindow(QMainWindow):
         for index in range(self.tabs.count()):
             if self.tabs.tabData(index).document.path == resolved:
                 self.tabs.setCurrentIndex(index)
+                self.remember_recent(resolved)
                 return
         opened = self.read_document(path)
         if opened:
             self.load_document(opened)
+            self.remember_recent(resolved)
+
+    def remember_recent(self, path):
+        path = str(path)
+        recent = self.settings.value("recent", [], type=list)
+        self.settings.setValue("recent", [path, *(item for item in recent if os.path.normcase(item)
+                                                  != os.path.normcase(path))][:10])
+
+    def refresh_recent(self):
+        self.recent_menu.clear()
+        self.recent_menu.setToolTipsVisible(True)
+        recent = self.settings.value("recent", [], type=list)
+        for entry in recent:
+            path = Path(entry)
+            folder = path.parent.name or str(path.parent)
+            action = self.recent_menu.addAction(f"{path.name} · {folder}".replace("&", "&&"))
+            action.setToolTip(str(path))
+            action.triggered.connect(lambda checked, target=path: self.open_document(target))
+        if recent:
+            self.recent_menu.addSeparator()
+            clear = self.recent_menu.addAction("최근 문서 기록 지우기")
+            clear.triggered.connect(lambda: self.settings.remove("recent"))
+        else:
+            self.recent_menu.addAction("최근 문서 없음").setEnabled(False)
 
     def load_document(self, opened):
+        tab = DocumentTab(opened)
         with QSignalBlocker(self.tabs):
             index = self.tabs.addTab(opened.name)
-            self.tabs.setTabData(index, DocumentTab(opened))
+            self.tabs.setTabData(index, tab)
+            close = self.button("", lambda: self.close_document_tab(tab), name="tabClose", tooltip="PDF 탭 닫기")
+            close.setFixedSize(22, 22)
+            close.setIconSize(QSize(16, 16))
+            close.setIcon(tool_icon("close", self.colors))
+            self.tabs.setTabButton(index, QTabBar.ButtonPosition.RightSide, close)
             self.tabs.setCurrentIndex(index)
         self.activate_tab(index)
+
+    def close_document_tab(self, tab):
+        for index in range(self.tabs.count()):
+            if self.tabs.tabData(index) is tab:
+                self.close_tab(index)
+                break
 
     def store_tab(self):
         tab = self.active_tab
@@ -653,6 +793,7 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self.error("PDF 저장 실패", error)
             return False
+        self.remember_recent(self.doc.path)
         self.update_state()
         self.status.setText(f"저장 완료 · {self.doc.path.name}")
         return True
@@ -676,6 +817,26 @@ class MainWindow(QMainWindow):
             return
         self.load_document(doc)
         self.status.setText(f"이미지 {len(paths)}개로 PDF를 만들었습니다. Ctrl+S로 저장하세요.")
+
+    def split_pdf(self):
+        title = "PDF 여러 파일로 나누기"
+        maximum = self.doc.pdf.page_count - 1
+        size, accepted = QInputDialog.getInt(self, title, "파일당 페이지 수", 1, 1, maximum)
+        if not accepted:
+            return
+        location = str(self.doc.path.parent) if self.doc.path else QDir.homePath()
+        folder = QFileDialog.getExistingDirectory(self, "나눈 PDF를 저장할 위치", location)
+        if not folder:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            paths = self.doc.split(folder, size)
+        except Exception as error:
+            QApplication.restoreOverrideCursor()
+            self.error(title, error)
+            return
+        QApplication.restoreOverrideCursor()
+        self.status.setText(f"PDF {len(paths)}개 저장 완료 · {paths[0].parent}")
 
     def export_pages(self):
         dialog = PagesDialog(self, self.doc.pdf.page_count, self.page_index + 1, "export")
@@ -877,6 +1038,8 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         menu.addAction(self.actions["copy_pages"])
         menu.addAction(self.actions["paste_pages"])
+        menu.addSeparator()
+        menu.addAction(self.actions["organize"])
         menu.exec(self.thumbs.viewport().mapToGlobal(position))
 
     def copy_selected_pages(self):
@@ -910,7 +1073,7 @@ class MainWindow(QMainWindow):
         self.thumbs.blockSignals(True)
         self.thumbs.clear()
         placeholder = QPixmap(94, 108)
-        placeholder.fill(QColor("#edf1f3"))
+        placeholder.fill(QColor(self.colors["quiet"]))
         icon = QIcon(placeholder)
         for index in range(self.doc.pdf.page_count):
             item = QListWidgetItem(icon, str(index + 1))
@@ -1104,12 +1267,24 @@ class MainWindow(QMainWindow):
                 annot.update()
             self.mutate("메모 수정", pdf.PDF_PERM_ANNOTATE, replace)
 
-    def turn_page(self):
+    def show_organizer(self):
+        dialog = OrganizeDialog(self, self.doc.pdf, self.page_index)
+        if not dialog.exec():
+            return
+        plan = dialog.plan
+        if plan == [(index, 0) for index in range(self.doc.pdf.page_count)]:
+            return
+        target = next((index for index, (source, _) in enumerate(plan) if source == self.page_index),
+                      min(self.page_index, len(plan) - 1))
+        self.mutate("페이지 정리", pdf.PDF_PERM_ASSEMBLE, lambda doc: organize_pages(doc, plan),
+                    target, structure=True)
+
+    def turn_page(self, angle):
         index = self.page_index
 
         def rotate(doc):
             page = doc[index]
-            page.set_rotation(page.rotation + 90)
+            page.set_rotation(page.rotation + angle)
 
         self.mutate("페이지 회전", pdf.PDF_PERM_ASSEMBLE, rotate)
 
@@ -1169,6 +1344,8 @@ class MainWindow(QMainWindow):
             self.setWindowState(previous)
             for widget in self.chrome():
                 widget.show()
+            self.work.setContentsMargins(8, 8, 8, 8)
+            self.update_panels()
             self.set_mode(mode)
             self.set_zoom(zoom)
         else:
@@ -1176,13 +1353,26 @@ class MainWindow(QMainWindow):
             self.set_mode("hand")
             for widget in self.chrome():
                 widget.hide()
+            self.work.setContentsMargins(0, 0, 0, 0)
+            self.update_panels()
             self.showFullScreen()
             self.set_zoom("page")
             self.page_view.setFocus()
         self.update_state()
 
     def chrome(self):
-        return self.menuBar(), self.masthead, self.tabs, self.toolbar, self.sidebar, self.inspector, self.footer
+        return self.menuBar(), self.masthead, self.tabs, self.toolbar, self.footer
+
+    def update_panels(self, remember=False):
+        visible = self.doc is not None and self.presentation_state is None
+        for name, panel in (("sidebar", self.sidebar), ("inspector", self.inspector)):
+            checked = self.actions[name].isChecked()
+            panel.setVisible(visible and checked)
+            if remember:
+                self.settings.setValue(name, checked)
+        if remember and visible:
+            self.resize_timer.start()
+            self.thumbs_timer.start()
 
     def keyPressEvent(self, event):
         if self.presentation_state:
@@ -1334,7 +1524,6 @@ def main():
     app.setApplicationName(APP)
     app.setStyle("Fusion")
     app.setFont(QFont("Malgun Gothic", 10))
-    app.setStyleSheet((ROOT / "assets/style.qss").read_text(encoding="utf-8"))
     window = MainWindow()
     window.show()
     paths = [path for path in sys.argv[1:] if Path(path).is_file()]
